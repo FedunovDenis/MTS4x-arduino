@@ -1,6 +1,8 @@
 #include <Arduino.h>
 #include <Wire.h>
 
+#include "MTS4x.h"
+
 #if defined(ESP8266)
   #include <ESP8266WiFi.h>
   #include <ESP8266WebServer.h>
@@ -14,8 +16,6 @@
 #else
   #error "This example is for ESP8266/ESP32 only"
 #endif
-
-#include "MTS4x.h"
 
 // -------------------- WIFI --------------------
 const char* WIFI_SSID     = "YOUR_SSID";      // <<< сюда свою сеть
@@ -36,54 +36,54 @@ const char* WIFI_PASSWORD = "YOUR_PASSWORD";  // <<< сюда пароль
 // -------------------- MTS4x CONFIG ------------
 MTS4X mts;
 
-// "максимальная точность" для метеостанции
-static const TempCfgMPS MTS_RATE    = MPS_1Hz;   // частота конверсий
+// «Максимальная точность» для метеостанции
+static const TempCfgMPS MTS_RATE    = MPS_1Hz;   // частота конверсий (в непрерывном режиме)
 static const TempCfgAVG MTS_AVG     = AVG_32;    // максимальное усреднение в чипе
 static const uint8_t    NUM_SAMPLES = 8;         // доп. усреднение в МК
 
-// программная калибровка, °C (подгоняется по эталонному термометру)
+// Программная калибровка, °C (подгоняется по эталонному термометру)
 static const float TEMP_OFFSET_C = 0.0f;
 
 // -------------------- NARODMON (TCP/UDP 8283) ----------------
-#define NARODMON_ENABLE      1      // 0 — выключить, 1 — включить
-#define NARODMON_USE_UDP     0      // 0 — TCP, 1 — UDP
+#define NARODMON_ENABLE   1   // 0 — выключить, 1 — включить
+#define NARODMON_USE_UDP  0   // 0 — TCP, 1 — UDP
 
-const char*   NARODMON_HOST    = "narodmon.ru";
-const uint16_t NARODMON_PORT   = 8283;
+const char*    NARODMON_HOST  = "narodmon.ru";
+const uint16_t NARODMON_PORT  = 8283;
 
 // Минимальный интервал отправки на NarodMon (по правилам не чаще 1 раза в минуту)
-// Выбери один из вариантов: 1, 5 или 10 минут
+// Можно выбрать 1, 5 или 10 минут
 const unsigned long NARODMON_INTERVAL_1_MIN_MS  = 1UL  * 60UL * 1000UL;
 const unsigned long NARODMON_INTERVAL_5_MIN_MS  = 5UL  * 60UL * 1000UL;
 const unsigned long NARODMON_INTERVAL_10_MIN_MS = 10UL * 60UL * 1000UL;
 
 // <<< ВЫБОР ТЕКУЩЕГО ИНТЕРВАЛА >>>
 //const unsigned long NARODMON_MIN_INTERVAL_MS = NARODMON_INTERVAL_1_MIN_MS;
- const unsigned long NARODMON_MIN_INTERVAL_MS = NARODMON_INTERVAL_5_MIN_MS;
+const unsigned long NARODMON_MIN_INTERVAL_MS = NARODMON_INTERVAL_5_MIN_MS;
 // const unsigned long NARODMON_MIN_INTERVAL_MS = NARODMON_INTERVAL_10_MIN_MS;
 
 // Название станции и сенсора (опционально)
-const char* NARODMON_STATION_NAME = "Meteo";        // #MAC#Meteo
-const char* NARODMON_SENSOR_NAME  = "Outdoor";      // #T1#19.73#Outdoor
+const char* NARODMON_STATION_NAME = "Meteo";   // #MAC#Meteo
+const char* NARODMON_SENSOR_NAME  = "Outdoor"; // #T1#19.73#Outdoor
 
 // NarodMon ID = MAC платы в формате AA-BB-CC-DD-EE-FF (автоматически)
 String   g_narodmonMac;
 unsigned long g_lastNarodmonSendMs = 0;
-WiFiUDP narodmonUdp;               // для UDP-режима
+WiFiUDP  narodmonUdp;
 
 // -------------------- STATE -------------------
-float    g_lastTempC     = NAN;    // усреднённая + OFFSET температура за последний цикл измерения
-bool     g_lastCrcAllOk  = false;  // true, если все выборки в последнем цикле с CRC OK
+float    g_lastTempC     = NAN;    // усреднённая температура за цикл + OFFSET
+bool     g_lastCrcAllOk  = false;  // все ли выборки цикла с CRC OK
 uint32_t g_crcOkTotal    = 0;
 uint32_t g_crcFailTotal  = 0;
 
+const unsigned long MEASURE_INTERVAL_MS = 2000UL; // период измерений
 unsigned long g_lastMeasureMs = 0;
-const unsigned long MEASURE_INTERVAL_MS = 2000UL; // цикл измерений раз в 2 с
 
 // Аккумулятор для усреднения за интервал NarodMon
-double   g_nmSum      = 0.0;      // сумма температур за интервал
-uint32_t g_nmCount    = 0;        // количество учтённых значений
-uint32_t g_nmCrcBad   = 0;        // сколько раз не учитывали из-за CRC (для отладки)
+double   g_nmSum      = 0.0;
+uint32_t g_nmCount    = 0;
+uint32_t g_nmCrcBad   = 0;
 
 // --------------------------------------------------------
 // NarodMon MAC = MAC WiFi (AA:BB:CC:DD:EE:FF -> AA-BB-CC-DD-EE-FF)
@@ -91,7 +91,7 @@ uint32_t g_nmCrcBad   = 0;        // сколько раз не учитывал
 void initNarodmonMac()
 {
 #if defined(ESP8266) || defined(ESP32)
-  String mac = WiFi.macAddress();
+  String mac = WiFi.macAddress(); 
   for (uint16_t i = 0; i < mac.length(); ++i) {
     if (mac[i] == ':') mac[i] = '-';
   }
@@ -127,7 +127,6 @@ void connectWiFi()
   }
   Serial.println();
 
-  // MAC доступен и до соединения, но заодно и тут, когда всё уже стартовало
   initNarodmonMac();
 
   if (WiFi.status() == WL_CONNECTED) {
@@ -144,7 +143,7 @@ void connectWiFi()
 }
 
 // --------------------------------------------------------
-// ОДИН ЦИКЛ ИЗМЕРЕНИЙ С УСРЕДНЕНИЕМ
+// ОДИН ЦИКЛ ИЗМЕРЕНИЙ С УСРЕДНЕНИЕМ (continuous mode)
 // --------------------------------------------------------
 void doMeasurement()
 {
@@ -156,18 +155,19 @@ void doMeasurement()
     float t;
     bool  crcOk;
 
-    // ждём новое значение, с CRC
-    bool ok = mts.readTemperatureCrc(t, crcOk, true);
+    // В непрерывном режиме: НЕ ждём нового значения, берём текущее
+    bool ok = mts.readTemperatureCrc(t, crcOk, false);
+
     if (ok && crcOk) {
       sum += t;
       goodSamples++;
       crcOkSamples++;
-      g_crcOkTotal++;
-    } else {
-      g_crcFailTotal++;
     }
 
-    delay(50); // пауза между выборками
+    if (ok && crcOk) g_crcOkTotal++;
+    else             g_crcFailTotal++;
+
+    delay(50);  // немного разнесём выборки
   }
 
   if (goodSamples > 0) {
@@ -176,19 +176,18 @@ void doMeasurement()
 
     g_lastTempC    = avg;
     g_lastCrcAllOk = (crcOkSamples == NUM_SAMPLES && goodSamples == NUM_SAMPLES);
-  } else {
-    g_lastTempC    = NAN;
-    g_lastCrcAllOk = false;
-  }
 
-  // --- накопитель для NarodMon: усреднение за интервал ---
-  if (!isnan(g_lastTempC)) {
+    // копим для NarodMon только хорошие циклы
     if (g_lastCrcAllOk) {
       g_nmSum   += g_lastTempC;
       g_nmCount += 1;
     } else {
       g_nmCrcBad += 1;
     }
+  } else {
+    g_lastTempC    = NAN;
+    g_lastCrcAllOk = false;
+    g_nmCrcBad    += 1;
   }
 
   Serial.print(F("Temp(avg): "));
@@ -198,12 +197,12 @@ void doMeasurement()
     Serial.print(g_lastTempC, 3);
     Serial.print(F(" °C"));
   }
-  Serial.print(F("  CRC last cycle: "));
+  Serial.print(F("  CRC cycle: "));
   Serial.println(g_lastCrcAllOk ? F("ALL OK") : F("HAS ERRORS"));
 }
 
 // --------------------------------------------------------
-// ПЕРИОДИЧЕСКОЕ ОБНОВЛЕНИЕ ТЕМПЕРАТУРЫ
+// ПЕРИОДИЧЕСКОЕ ОБНОВЛЕНИЕ
 // --------------------------------------------------------
 void updateTemperatureIfNeeded()
 {
@@ -215,7 +214,7 @@ void updateTemperatureIfNeeded()
 }
 
 // --------------------------------------------------------
-// NarodMon: формирование пакета TCP/UDP на порт 8283
+// NarodMon: формирование пакета TCP/UDP
 // Формат:
 // #MAC[#NAME]\n
 // #T1#value[#name]\n
@@ -226,7 +225,6 @@ String buildNarodmonPacket(float tempToSendC)
   String pkt;
   pkt.reserve(256);
 
-  // 1) MAC и имя станции
   pkt += "#";
   pkt += g_narodmonMac;
   if (NARODMON_STATION_NAME && NARODMON_STATION_NAME[0] != '\0') {
@@ -235,24 +233,20 @@ String buildNarodmonPacket(float tempToSendC)
   }
   pkt += "\n";
 
-  // 2) Само измерение температуры
-  //   пример: #T1#19.73 или #T1#19.73#Улица
   pkt += "#T1#";
-  pkt += String(tempToSendC, 2);  // 2 знака после запятой
+  pkt += String(tempToSendC, 2);
   if (NARODMON_SENSOR_NAME && NARODMON_SENSOR_NAME[0] != '\0') {
     pkt += "#";
     pkt += NARODMON_SENSOR_NAME;
   }
   pkt += "\n";
 
-  // 3) конец пакета
   pkt += "##\n";
-
   return pkt;
 }
 
 // --------------------------------------------------------
-// NarodMon: отправка пакета (TCP или UDP) со средним за интервал
+// NarodMon: отправка пакета со средним за интервал
 // --------------------------------------------------------
 void sendToNarodmonIfNeeded()
 {
@@ -262,18 +256,16 @@ void sendToNarodmonIfNeeded()
   unsigned long now = millis();
   if (now - g_lastNarodmonSendMs < NARODMON_MIN_INTERVAL_MS) return;
 
-  // готовим среднее за интервал
-  float tempToSend;
+  g_lastNarodmonSendMs = now;
 
+  // выбираем, что посылать: среднее за интервал или последний замер
+  float tempToSend;
   if (g_nmCount > 0) {
     tempToSend = (float)(g_nmSum / (double)g_nmCount);
   } else {
-    // на всякий случай fallback — последнее измерение
-    if (isnan(g_lastTempC)) return;  // вообще нечего отправлять
+    if (isnan(g_lastTempC)) return;
     tempToSend = g_lastTempC;
   }
-
-  g_lastNarodmonSendMs = now;
 
   String pkt = buildNarodmonPacket(tempToSend);
   Serial.println(F("[NarodMon] Avg interval value: "));
@@ -285,7 +277,6 @@ void sendToNarodmonIfNeeded()
   Serial.println(pkt);
 
 #if NARODMON_USE_UDP
-  // ------------ UDP ------------
   if (!narodmonUdp.begin(0)) {
     Serial.println(F("[NarodMon] UDP begin() failed"));
     return;
@@ -298,7 +289,6 @@ void sendToNarodmonIfNeeded()
   narodmonUdp.endPacket();
   Serial.println(F("[NarodMon] UDP packet sent"));
 #else
-  // ------------ TCP ------------
   WiFiClient client;
   Serial.println(F("[NarodMon] Connecting TCP..."));
   if (!client.connect(NARODMON_HOST, NARODMON_PORT)) {
@@ -306,10 +296,8 @@ void sendToNarodmonIfNeeded()
     return;
   }
 
-  // Важно: протокол требует только '\n' (0x0A), без \r\n
   client.print(pkt);
 
-  // можно (необязательно) немного подождать и прочитать ответ
   unsigned long t0 = millis();
   while (client.connected() && millis() - t0 < 3000) {
     if (client.available()) {
@@ -325,7 +313,7 @@ void sendToNarodmonIfNeeded()
 
   client.stop();
   Serial.println(F("[NarodMon] TCP packet sent"));
-#endif // NARODMON_USE_UDP
+#endif
 
   // после отправки — обнуляем накопитель интервала
   g_nmSum    = 0.0;
@@ -333,7 +321,7 @@ void sendToNarodmonIfNeeded()
   g_nmCrcBad = 0;
 
 #else
-  // NarodMon отключён
+  (void)sendToNarodmonIfNeeded; // подавить warning
 #endif
 }
 
@@ -343,6 +331,15 @@ void sendToNarodmonIfNeeded()
 void handleRoot()
 {
   updateTemperatureIfNeeded();
+
+  // снимок состояния для HTML
+  float    temp         = g_lastTempC;
+  bool     crcAllOk     = g_lastCrcAllOk;
+  uint32_t crcOkTotal   = g_crcOkTotal;
+  uint32_t crcFailTotal = g_crcFailTotal;
+  double   nmSum        = g_nmSum;
+  uint32_t nmCount      = g_nmCount;
+  uint32_t nmBad        = g_nmCrcBad;
 
   String html;
   html.reserve(2300);
@@ -369,32 +366,30 @@ void handleRoot()
   html += F("<h1>MTS4P+T4 — метеостанция</h1>");
 
   html += F("<div class='temp'>");
-  if (isnan(g_lastTempC)) {
+  if (isnan(temp)) {
     html += F("--.- &deg;C");
   } else {
-    html += String(g_lastTempC, 3);
+    html += String(temp, 3);
     html += F(" &deg;C");
   }
   html += F("</div>");
 
-  // CRC-индикатор
   html += F("<div class='small'>CRC последнего цикла: ");
-  if (g_lastCrcAllOk) {
+  if (crcAllOk) {
     html += F("<span class='ok'>OK (все выборки)</span>");
   } else {
     html += F("<span class='bad'>есть ошибки</span>");
   }
   html += F("<br>Всего CRC OK: ");
-  html += String(g_crcOkTotal);
+  html += String(crcOkTotal);
   html += F(", CRC FAIL: ");
-  html += String(g_crcFailTotal);
+  html += String(crcFailTotal);
   html += F("<br>Усреднение для NarodMon: count=");
-  html += String(g_nmCount);
+  html += String(nmCount);
   html += F(", пропущено по CRC=");
-  html += String(g_nmCrcBad);
+  html += String(nmBad);
   html += F("</div><hr style='border:0;border-top:1px solid #333;margin:10px 0;'>");
 
-  // Паспортные характеристики
   html += F("<div class='small'>");
   html += F("<b>Датчик:</b> MTS4P+T4 (семейство MTS4)<br>");
   html += F("<b>Диапазон чипа:</b> −103…+153&nbsp;&deg;C<br>");
@@ -410,7 +405,6 @@ void handleRoot()
 
   html += F("<hr style='border:0;border-top:1px solid #333;margin:10px 0;'>");
 
-  // Сеть + NarodMon
   html += F("<div class='small'>");
   html += F("<b>Wi-Fi IP:</b> ");
   if (WiFi.status() == WL_CONNECTED) {
@@ -451,20 +445,24 @@ void handleJson()
 {
   updateTemperatureIfNeeded();
 
+  float    temp         = g_lastTempC;
+  bool     crcAllOk     = g_lastCrcAllOk;
+  uint32_t crcOkTotal   = g_crcOkTotal;
+  uint32_t crcFailTotal = g_crcFailTotal;
+  double   nmSum        = g_nmSum;
+  uint32_t nmCount      = g_nmCount;
+  uint32_t nmBad        = g_nmCrcBad;
+
   String json;
   json.reserve(600);
   json += F("{");
 
-  // температура
   json += F("\"temperature_c\":");
-  if (isnan(g_lastTempC)) {
-    json += F("null");
-  } else {
-    json += String(g_lastTempC, 3);
-  }
+  if (isnan(temp)) json += F("null");
+  else             json += String(temp, 3);
 
   json += F(",\"crc_ok\":");
-  json += (g_lastCrcAllOk ? F("true") : F("false"));
+  json += (crcAllOk ? F("true") : F("false"));
 
   json += F(",\"samples\":");
   json += String(NUM_SAMPLES);
@@ -474,21 +472,19 @@ void handleJson()
   json += String(TEMP_OFFSET_C, 3);
 
   json += F(",\"crc_ok_total\":");
-  json += String(g_crcOkTotal);
+  json += String(crcOkTotal);
   json += F(",\"crc_fail_total\":");
-  json += String(g_crcFailTotal);
+  json += String(crcFailTotal);
 
-  // накопитель NarodMon
   json += F(",\"narodmon_avg_acc\":{");
   json += F("\"sum\":");
-  json += String(g_nmSum, 6);
+  json += String(nmSum, 6);
   json += F(",\"count\":");
-  json += String(g_nmCount);
+  json += String(nmCount);
   json += F(",\"crc_bad\":");
-  json += String(g_nmCrcBad);
+  json += String(nmBad);
   json += F("}");
 
-  // паспорт датчика
   json += F(",\"sensor\":\"MTS4P+T4\"");
   json += F(",\"range_c\":[-103,153]");
   json += F(",\"best_accuracy_c\":0.1");
@@ -526,9 +522,8 @@ void setup()
   Serial.begin(115200);
   delay(300);
   Serial.println();
-  Serial.println(F("MTS4x Meteo + NarodMon (TCP/UDP 8283, interval avg) start"));
+  Serial.println(F("MTS4x Meteo + NarodMon (loop-only) start"));
 
-  // I2C + датчик
   Wire.begin(I2C_SDA_PIN, I2C_SCL_PIN);
 
   if (!mts.begin(I2C_SDA_PIN, I2C_SCL_PIN)) {
@@ -538,20 +533,17 @@ void setup()
     Serial.println(F("MTS4x init OK"));
   }
 
-  // STOP + AVG_32, single-shot
-  mts.setConfig(MTS_RATE, MTS_AVG, true);          // sleep=true
-  mts.setMode(MEASURE_STOP, false);                // стоп, heater off
+  // Непрерывный режим: чип сам крутит измерения, мы только читаем
+  mts.setConfig(MTS_RATE, MTS_AVG, false);          // sleep=false
+  mts.setMode(MEASURE_CONTINUOUS, false);           // continuous, heater off
 
-  // Wi-Fi
   connectWiFi();
 
-  // HTTP маршруты
   server.on("/", handleRoot);
   server.on("/json", handleJson);
   server.onNotFound([]() {
     server.send(404, "text/plain; charset=utf-8", "404 Not found");
   });
-
   server.begin();
   Serial.println(F("HTTP server started"));
 }
