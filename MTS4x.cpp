@@ -2,17 +2,22 @@
 #include <string.h>
 #include <math.h>
 
-// Local CRC8 (polynomial x^8 + x^5 + x^4 + 1, 0x31, init 0x00)
+// -----------------------------------------------------------------------------
+// CRC8: Dallas/Maxim style (x^8 + x^5 + x^4 + 1, poly 0x31, LSB-first, init 0x00)
+// Это тот же полином, что в даташите, но реализованный в "дәлласовском" порядке
+// бит (как у DS18B20). Именно такой вариант, скорее всего, использует MTS4.
+// -----------------------------------------------------------------------------
 static uint8_t mts4x_crc8(const uint8_t *data, size_t len) {
     uint8_t crc = 0x00;
     while (len--) {
-        crc ^= *data++;
+        uint8_t in = *data++;
         for (uint8_t i = 0; i < 8; ++i) {
-            if (crc & 0x80) {
-                crc = (uint8_t)((crc << 1) ^ 0x31);
-            } else {
-                crc <<= 1;
+            uint8_t mix = (crc ^ in) & 0x01;
+            crc >>= 1;
+            if (mix) {
+                crc ^= 0x8C;    // отражённый полином 0x31
             }
+            in >>= 1;
         }
     }
     return crc;
@@ -26,7 +31,8 @@ MTS4X::MTS4X(uint8_t address, TwoWire &wire)
 : _wire(&wire),
   _addr(address),
   _lastError(MTS4X_ERR_OK),
-  _busClock(400000UL) {
+  _busClock(400000UL),
+  _useCrc(true) {
 }
 
 void MTS4X::setError(int8_t err) {
@@ -48,12 +54,13 @@ void MTS4X::setBusClock(uint32_t hz) {
     }
 }
 
+void MTS4X::setUseCrc(bool enable) {
+    _useCrc = enable;
+}
+
 bool MTS4X::begin(int32_t sda, int32_t scl) {
 #if defined(ESP8266) || defined(ESP32)
-    if (!_wire->begin(sda, scl)) {
-        setError(MTS4X_ERR_WIRE);
-        return false;
-    }
+    _wire->begin(sda, scl);
 #else
     (void)sda;
     (void)scl;
@@ -153,7 +160,7 @@ bool MTS4X::readRegisterRaw(uint8_t startReg, uint8_t *data, size_t len) {
     size_t toRead = len;
     size_t offset = 0;
     while (toRead > 0) {
-        uint8_t chunk = (toRead > 32) ? 32 : (uint8_t)toRead; // Wire buffer safe
+        uint8_t chunk = (toRead > 32) ? 32 : (uint8_t)toRead;
         uint8_t got   = _wire->requestFrom((int)_addr, (int)chunk);
         if (got != chunk) {
             setError(MTS4X_ERR_WIRE);
@@ -241,7 +248,7 @@ bool MTS4X::setConfig(TempCfgMPS mps, TempCfgAVG avg, bool sleep) {
     uint8_t cfg = 0;
     cfg |= ((uint8_t)mps & 0xE0);
     cfg |= ((uint8_t)avg & 0x18);
-    if (sleep) cfg |= 0x01; // Sleep_en = 1
+    if (sleep) cfg |= 0x01;
     return writeRegister(MTS4X_TEMP_CFG, cfg);
 }
 
@@ -265,7 +272,7 @@ bool MTS4X::readTemperatureRawWithCrc(int16_t &raw, bool &crcOk,
             if ((st & MTS4X_STATUS_BUSY) == 0) {
                 break;
             }
-            if (millis() - start > 50UL) {
+            if (millis() - start > 200UL) {
                 setError(MTS4X_ERR_TIMEOUT);
                 return false;
             }
@@ -274,16 +281,31 @@ bool MTS4X::readTemperatureRawWithCrc(int16_t &raw, bool &crcOk,
     }
 
     uint8_t buf[3];
-    if (!readRegisterRaw(MTS4X_TEMP_LSB, buf, 3)) {
-        return false;
+    for (uint8_t attempt = 0; attempt < 3; ++attempt) {
+        if (!readRegisterRaw(MTS4X_TEMP_LSB, buf, 3)) {
+            return false;
+        }
+
+        raw = (int16_t)(((uint16_t)buf[1] << 8) | (uint16_t)buf[0]);
+
+        if (!_useCrc) {
+            crcOk = true;
+            setError(MTS4X_ERR_OK);
+            return true;
+        }
+
+        uint8_t calc = mts4x_crc8(buf, 2);   // CRC по Temp_lsb, Temp_msb
+        crcOk = (calc == buf[2]);
+
+        if (crcOk) {
+            setError(MTS4X_ERR_OK);
+            return true;
+        }
+        delay(2);
     }
 
-    uint8_t calc = mts4x_crc8(buf, 2);
-    crcOk = (calc == buf[2]);
-
-    raw = (int16_t)(((uint16_t)buf[1] << 8) | (uint16_t)buf[0]);
-    setError(crcOk ? MTS4X_ERR_OK : MTS4X_ERR_CRC);
-    return true;
+    setError(MTS4X_ERR_CRC);
+    return false;
 }
 
 bool MTS4X::readTemperatureRaw(int16_t &raw, bool waitOnNewVal) {
@@ -338,13 +360,12 @@ bool MTS4X::singleShot(float &tC) {
 // -----------------------------------------------------------------------------
 
 bool MTS4X::heaterOn() {
-    // Keep current mode, just enable heater bits
     uint8_t cmd = 0;
     if (!readRegister(MTS4X_TEMP_CMD, cmd)) {
         return false;
     }
-    cmd &= 0xF0;       // clear heater bits
-    cmd |= 0x0A;       // heater on
+    cmd &= 0xF0;
+    cmd |= 0x0A;
     return writeRegister(MTS4X_TEMP_CMD, cmd);
 }
 
@@ -353,7 +374,7 @@ bool MTS4X::heaterOff() {
     if (!readRegister(MTS4X_TEMP_CMD, cmd)) {
         return false;
     }
-    cmd &= 0xF0;       // clear heater bits -> heater off
+    cmd &= 0xF0;
     return writeRegister(MTS4X_TEMP_CMD, cmd);
 }
 
@@ -372,10 +393,8 @@ bool MTS4X::isHeaterOn(bool &on) {
 
 bool MTS4X::setAlertMode(bool enable, MTS4xAlertMode mode) {
     uint8_t reg = 0;
-    // bit7 = Alert_en (0=enable, 1=disable)
-    // bit6 = mode
-    if (!enable) {
-        reg |= 0x80; // disable alerts
+    if (enable) {
+        reg |= 0x80;
     }
     if (mode == ALERT_MODE_HIGH_TH_LOW_ALARM) {
         reg |= 0x40;
@@ -388,7 +407,7 @@ bool MTS4X::getAlertMode(bool &enable, MTS4xAlertMode &mode) {
     if (!readRegister(MTS4X_ALERT_MODE, reg)) {
         return false;
     }
-    enable = ((reg & 0x80) == 0); // 0 = enabled, 1 = disabled
+    enable = (reg & 0x80);
     mode   = (reg & 0x40) ? ALERT_MODE_HIGH_TH_LOW_ALARM
                           : ALERT_MODE_HIGH_TH_LOW_CLEAR;
     return true;
@@ -595,7 +614,6 @@ bool MTS4X::softReset(bool waitReady, uint32_t timeoutMs) {
 // -----------------------------------------------------------------------------
 
 bool MTS4X::setParasiticPower(bool enable) {
-    // PPM_Cfg (0x63): bits 3:0 = 0b1010 to enable, others disable
     uint8_t val = enable ? 0x0A : 0x00;
     return writeRegister(MTS4X_PPM_CFG, val);
 }

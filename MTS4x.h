@@ -111,6 +111,7 @@ class MTS4X {
     // Initialization
     bool begin(int32_t sda, int32_t scl);
     bool begin(int32_t sda, int32_t scl, MeasurementMode mode);
+    void setUseCrc(bool enable);
 
     void     setBusClock(uint32_t hz);
     uint32_t busClock() const;
@@ -184,6 +185,7 @@ class MTS4X {
     uint8_t    _addr;
     int8_t     _lastError;
     uint32_t   _busClock;
+    bool       _useCrc;
 
     bool writeRegister(uint8_t reg, uint8_t value);
     bool writeRegisterRaw(uint8_t reg, const uint8_t *data, size_t len);

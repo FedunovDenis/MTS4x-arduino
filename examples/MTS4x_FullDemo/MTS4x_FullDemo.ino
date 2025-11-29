@@ -236,7 +236,7 @@ void setup() {
   }
 
   // Р§Р°СЃС‚РѕС‚Р° С€РёРЅС‹ (РјРѕР¶РЅРѕ РїРѕРґРЅСЏС‚СЊ РґРѕ 2 РњР“С†, РµСЃР»Рё Р¶РµР»РµР·Рѕ РїРѕР·РІРѕР»СЏРµС‚)
-  mts.setBusClock(400000);  // 400 РєР“С†
+  mts.setBusClock(100000);  // 100 кГц для длинных линий\n\n  // Отключить CRC на шумной линии\n  mts.setUseCrc(false);
 
   if (!mts.setConfig(MTS_RATE, MTS_AVG, MTS_SLEEP)) {
     Serial.print(F("setConfig() FAILED, err="));
