@@ -1,15 +1,8 @@
 ﻿/*
-  MTS4x_MeteoStation.ino
-
-  Метеостанция на ESP8266/ESP32 с датчиком температуры MTS4P+T4 (линейка MTS4x).
-
-  Возможности:
-  - измерение температуры с максимально возможной точностью;
-  - контроль CRC каждого измерения и счётчики ошибок;
-  - веб-страница (/) с крупным выводом температуры и статусом;
-  - JSON API (/json) для интеграций;
-  - отправка усреднённой температуры на сервис narodmon.ru по TCP (порт 8283);
-  - Wi-Fi с отключённым power-save и авто-реконнектом.
+  MTS4x_MeteoStation_v2.ino
+  
+  Метеостанция на ESP8266/ESP32 с датчиком MTS4P+T4.
+  Версия с улучшенным Wi-Fi менеджером (Reconnection logic + Modem sleep disable).
 */
 
 #include <Arduino.h>
@@ -34,53 +27,43 @@
 
 // --------------------- Настройки пользователя ----------------------
 
-// Wi-Fi
-const char* WIFI_SSID     = "YOUR_SSID";
-const char* WIFI_PASSWORD = "YOUR_PASSWORD";
+const char* WIFI_SSID     = "YOUR_SSID";      // <-- Впишите имя сети
+const char* WIFI_PASSWORD = "YOUR_PASSWORD";  // <-- Впишите пароль
 
-// Поправка температуры (калибровка), °C.
-// Например, датчик показывает 22.95 °C, эталон 23.10 °C => TEMP_OFFSET_C = 0.15f.
+// Калибровка температуры
 const float TEMP_OFFSET_C = 0.0f;
 
-// Сколько single-shot измерений делаем за один цикл обновления UI
+// Настройки усреднения UI
 static const uint8_t  UI_SAMPLES_PER_CYCLE   = 8;
-
-// Период обновления веб-страницы и измерений, мс
 static const unsigned long UI_UPDATE_INTERVAL_MS = 2000UL;
 
-// Интервал отправки на NarodMon, минут.
-// Можно переопределить ключом компиляции -DNARODMON_INTERVAL_MINUTES=1/5/10 и т.п.
+// Настройки NarodMon (интервал в минутах)
 #ifndef NARODMON_INTERVAL_MINUTES
-  #define NARODMON_INTERVAL_MINUTES 10
+  #define NARODMON_INTERVAL_MINUTES 5
 #endif
 
 static const unsigned long NARODMON_INTERVAL_MS =
     (unsigned long)NARODMON_INTERVAL_MINUTES * 60UL * 1000UL;
 
 // --------------------- Паспортные данные датчика -------------------
-
-// Для отображения на веб-странице и в JSON (чисто справочная информация).
 static const char* SENSOR_NAME             = "MTS4P+T4";
 static const char* SENSOR_RANGE_C          = "-40..+85";
 static const char* SENSOR_FULL_RANGE_C     = "-103..+153";
 static const char* SENSOR_BEST_RANGE_C     = "-25..+25";
-static const float SENSOR_BEST_ACCURACY_C  = 0.10f;   // ±0.1 °C
-static const float SENSOR_TYP_ACCURACY_C   = 0.25f;   // типично в -40..+85 °C
-static const float SENSOR_RESOLUTION_C     = 0.004f;  // 1 LSB = 0.004 °C
+static const float SENSOR_BEST_ACCURACY_C  = 0.10f;
+static const float SENSOR_TYP_ACCURACY_C   = 0.25f;
+static const float SENSOR_RESOLUTION_C     = 0.004f;
 
 // ----------------------------- Глобальные переменные ----------------
-
 MTS4X   mts;
 
-// Последняя усреднённая температура по UI_SAMPLES_PER_CYCLE
+// Данные измерений
 float   g_lastTempC        = NAN;
 bool    g_lastTempCrcOk    = false;
-
-// Счётчики CRC за всё время работы
 uint32_t g_crcOkTotal      = 0;
 uint32_t g_crcFailTotal    = 0;
 
-// Агрегатор для NarodMon
+// Агрегатор NarodMon
 float    g_nmSumTemp       = 0.0f;
 uint32_t g_nmCount         = 0;
 uint32_t g_nmCrcSkipped    = 0;
@@ -89,11 +72,12 @@ bool     g_nmLastSendOk    = false;
 unsigned long g_nmLastSendMs = 0;
 
 // Wi-Fi состояние
-int32_t       g_lastRssiDbm     = 0;
+int32_t       g_lastRssiDbm     = -100;
 unsigned long g_lastWifiCheckMs = 0;
-
-// Таймер обновления UI/измерений
 unsigned long g_lastUiUpdateMs  = 0;
+
+// Таймер для переподключения Wi-Fi
+unsigned long g_wifiReconnectTimer = 0;
 
 // ----------------------------- Вспомогательные функции --------------
 
@@ -103,50 +87,50 @@ static int wifiQuality(int32_t rssiDbm) {
   return 2 * (rssiDbm + 100);
 }
 
-// MAC в виде AA-BB-CC-DD-EE-FF (требуется для narodmon.ru)
 static String getMacDashed() {
   String mac = WiFi.macAddress();
   mac.replace(":", "-");
   return mac;
 }
 
-// Отправка одного усреднённого значения на NarodMon по TCP (порт 8283)
 static bool sendToNarodMon(float avgTempC) {
-  if (WiFi.status() != WL_CONNECTED) {
-    return false;
-  }
+  if (WiFi.status() != WL_CONNECTED) return false;
 
   WiFiClient client;
+  // Таймаут соединения 5 сек
+  client.setTimeout(5000);
+  
   if (!client.connect("narodmon.ru", 8283)) {
     return false;
   }
 
-  String macDashed = getMacDashed();
-
-  // Формат пакета:
-  // #MAC
-  // #T1#value
-  // ##
   String payload;
   payload.reserve(64);
   payload  = "#";
-  payload += macDashed;
+  payload += getMacDashed();
   payload += "\n#T1#";
   payload += String(avgTempC, 2);
   payload += "\n##\n";
 
   client.print(payload);
+  
+  // Ждем ответа (необязательно, но полезно для диагностики)
+  unsigned long timeout = millis();
+  while (client.available() == 0) {
+    if (millis() - timeout > 2000) {
+      client.stop();
+      return true; // Считаем, что отправили (UDP-style подход), или false если строг
+    }
+  }
   client.stop();
   return true;
 }
 
-// Один цикл измерений: делаем несколько single-shot, проверяем CRC и усредняем
 static void performMeasurementCycle() {
   uint8_t okCount = 0;
   float   sum     = 0.0f;
 
   for (uint8_t i = 0; i < UI_SAMPLES_PER_CYCLE; ++i) {
-    // Запуск одиночного измерения
     if (!mts.startSingleMessurement()) {
       ++g_crcFailTotal;
       delay(5);
@@ -155,6 +139,7 @@ static void performMeasurementCycle() {
 
     float tC    = NAN;
     bool  crcOk = false;
+    // Чтение с проверкой CRC
     if (!mts.readTemperatureCrc(tC, crcOk, true)) {
       ++g_crcFailTotal;
       delay(5);
@@ -166,15 +151,14 @@ static void performMeasurementCycle() {
       sum += tC;
       ++okCount;
       ++g_crcOkTotal;
-
-      // Для NarodMon копим только значения с корректным CRC
+      
+      // Копим для NarodMon
       g_nmSumTemp += tC;
       ++g_nmCount;
     } else {
       ++g_crcFailTotal;
       ++g_nmCrcSkipped;
     }
-
     delay(5);
   }
 
@@ -194,7 +178,7 @@ static void handleRoot() {
   page.reserve(2048);
 
   page += F("<!DOCTYPE html><html lang='ru'><head><meta charset='UTF-8'>");
-  page += F("<title>MTS4P+T4 — метеостанция</title>");
+  page += F("<title>MTS4P+T4 Station</title>");
   page += F("<meta name='viewport' content='width=device-width,initial-scale=1'>");
   page += F("<meta http-equiv='refresh' content='5'>");
   page += F("<style>"
@@ -202,15 +186,15 @@ static void handleRoot() {
             "background:#111;color:#eee;margin:0;padding:12px;}"
             ".card{background:#1e1e1e;border-radius:10px;padding:10px 12px;margin-bottom:10px;}"
             ".temp{font-size:2.6rem;font-weight:600;margin:0.4rem 0;}"
-            ".ok{color:#4caf50;}.fail{color:#ff5252;}"
+            ".ok{color:#4caf50;}.fail{color:#ff5252;}.warn{color:#ff9800;}"
             ".label{font-size:0.85rem;color:#aaa;margin-bottom:0.2rem;}"
             ".small{font-size:0.78rem;color:#888;}"
             ".value{font-family:monospace;font-size:0.9rem;}"
             "</style></head><body>");
 
-  page += F("<h1>MTS4P+T4 — метеостанция</h1>");
+  page += F("<h1>MTS4P+T4 Station</h1>");
 
-  // Температура и CRC
+  // Карточка: Температура
   page += F("<div class='card'>");
   page += F("<div class='label'>Текущая температура</div><div class='temp'>");
   if (isnan(g_lastTempC)) {
@@ -220,87 +204,48 @@ static void handleRoot() {
     page += F(" &deg;C");
   }
   page += F("</div>");
-
-  page += F("<div class='small'>CRC последнего цикла: ");
-  page += g_lastTempCrcOk
-          ? F("<span class='ok'>OK</span>")
-          : F("<span class='fail'>есть ошибки</span>");
-  page += F("<br>Всего CRC OK: ");
-  page += String(g_crcOkTotal);
-  page += F(", CRC FAIL: ");
-  page += String(g_crcFailTotal);
+  page += F("<div class='small'>CRC: ");
+  page += g_lastTempCrcOk ? F("<span class='ok'>OK</span>") : F("<span class='fail'>ERR</span>");
+  page += F(" | Всего OK/Fail: ");
+  page += String(g_crcOkTotal) + " / " + String(g_crcFailTotal);
   page += F("</div></div>");
 
-  // Wi-Fi
+  // Карточка: Wi-Fi
   page += F("<div class='card'>");
-  page += F("<div class='label'>Wi-Fi</div><div class='value'>");
+  page += F("<div class='label'>Wi-Fi Status</div><div class='value'>");
   page += F("SSID: ");
-  page += WIFI_SSID;
+  page += (WiFi.status() == WL_CONNECTED) ? WIFI_SSID : "Disconnected";
   page += F("<br>IP: ");
   page += WiFi.localIP().toString();
-  page += F("<br>MAC: ");
-  page += WiFi.macAddress();
   page += F("<br>RSSI: ");
   page += String(g_lastRssiDbm);
   page += F(" dBm (");
   page += String(wifiQuality(g_lastRssiDbm));
-  page += F("%)</div></div>");
-
-  // NarodMon
-  page += F("<div class='card'>");
-  page += F("<div class='label'>NarodMon.ru</div><div class='small'>");
-  page += F("Интервал отправки: ");
-  page += String((int)NARODMON_INTERVAL_MINUTES);
-  page += F(" мин");
-  page += F("<br>Скоплено для усреднения: ");
-  page += String(g_nmCount);
-  page += F(" (пропущено по CRC: ");
-  page += String(g_nmCrcSkipped);
-  page += F(")");
-  if (!isnan(g_nmLastAvg)) {
-    page += F("<br>Последний отправленный средний: ");
-    page += String(g_nmLastAvg, 3);
-    page += F(" &deg;C");
-    page += F("<br>Статус последней отправки: ");
-    page += g_nmLastSendOk ? F("OK") : F("ошибка");
-  } else {
-    page += F("<br>Пока ни одного пакета не отправлено.");
+  page += F("%)");
+  if (g_lastRssiDbm < -85 && g_lastRssiDbm > -100) {
+     page += F(" <span class='warn'>Weak!</span>");
   }
   page += F("</div></div>");
 
-  // Паспорт и режим измерений
+  // Карточка: NarodMon
   page += F("<div class='card'>");
-  page += F("<div class='label'>Датчик</div><div class='small'>");
-  page += F("Модуль: ");
-  page += SENSOR_NAME;
-  page += F("<br>Рекомендуемый диапазон: ");
-  page += SENSOR_RANGE_C;
-  page += F(" &deg;C");
-  page += F("<br>Внутренний диапазон чипа: ");
-  page += SENSOR_FULL_RANGE_C;
-  page += F(" &deg;C");
-  page += F("<br>Окно максимальной точности: ");
-  page += SENSOR_BEST_RANGE_C;
-  page += F(" &deg;C, &plusmn;");
-  page += String(SENSOR_BEST_ACCURACY_C, 2);
-  page += F(" &deg;C");
-  page += F("<br>Типичная точность в -40..+85 &deg;C: &plusmn;");
-  page += String(SENSOR_TYP_ACCURACY_C, 2);
-  page += F(" &deg;C");
-  page += F("<br>Разрешение: ");
-  page += String(SENSOR_RESOLUTION_C, 3);
-  page += F(" &deg;C/LSB");
-  page += F("<br>Режим: single-shot, MPS_1Hz, AVG_32 + программное усреднение ");
-  page += String(UI_SAMPLES_PER_CYCLE);
-  page += F(" измерений.");
-  page += F("<br>Поправка TEMP_OFFSET_C = ");
-  page += String(TEMP_OFFSET_C, 3);
-  page += F(" &deg;C");
+  page += F("<div class='label'>NarodMon.ru</div><div class='small'>");
+  page += F("Queue: ");
+  page += String(g_nmCount);
+  page += F(" samples<br>Last Avg: ");
+  if (!isnan(g_nmLastAvg)) {
+    page += String(g_nmLastAvg, 3);
+    page += F(" &deg;C (");
+    page += g_nmLastSendOk ? F("<span class='ok'>Sent</span>") : F("<span class='fail'>Fail</span>");
+    page += F(")");
+  } else {
+    page += F("Wait...");
+  }
   page += F("</div></div>");
 
-  page += F("<div class='small'>JSON API: <code>/json</code></div>");
-
+  page += F("<div class='small'>JSON API: <a href='/json' style='color:#fff'>/json</a></div>");
   page += F("</body></html>");
+  
   server.send(200, "text/html; charset=utf-8", page);
 }
 
@@ -309,98 +254,52 @@ static void handleJson() {
   json.reserve(512);
 
   json += F("{");
-
-  // Температура и CRC
   json += F("\"temperature_c\":");
-  if (isnan(g_lastTempC)) {
-    json += F("null,");
-  } else {
-    json += String(g_lastTempC, 3);
-    json += F(",");
-  }
+  if (isnan(g_lastTempC)) json += F("null,");
+  else { json += String(g_lastTempC, 3); json += F(","); }
 
-  json += F("\"crc_cycle_ok\":");
+  json += F("\"crc_ok\":");
   json += g_lastTempCrcOk ? F("true,") : F("false,");
+  
+  json += F("\"narodmon_last_send_ok\":");
+  if (g_nmLastSendMs == 0) json += F("null,");
+  else json += g_nmLastSendOk ? F("true,") : F("false,");
 
-  json += F("\"crc_total_ok\":");
-  json += String(g_crcOkTotal);
-  json += F(",\"crc_total_fail\":");
-  json += String(g_crcFailTotal);
-  json += F(",");
-
-  // Паспорт
-  json += F("\"sensor\":\"");
-  json += SENSOR_NAME;
-  json += F("\",\"range_c\":\"");
-  json += SENSOR_RANGE_C;
-  json += F("\",\"full_range_c\":\"");
-  json += SENSOR_FULL_RANGE_C;
-  json += F("\",\"best_accuracy_c\":");
-  json += String(SENSOR_BEST_ACCURACY_C, 2);
-  json += F(",\"best_accuracy_range_c\":\"");
-  json += SENSOR_BEST_RANGE_C;
-  json += F("\",\"resolution_c\":");
-  json += String(SENSOR_RESOLUTION_C, 3);
-  json += F(",");
-
-  // Усреднение и поправка
-  json += F("\"avg_mode\":\"AVG_32+");
-  json += String(UI_SAMPLES_PER_CYCLE);
-  json += F("x_single_shot\",");
-  json += F("\"samples\":");
-  json += String(UI_SAMPLES_PER_CYCLE);
-  json += F(",\"temp_offset_c\":");
-  json += String(TEMP_OFFSET_C, 3);
-  json += F(",");
-
-  // NarodMon состояние
-  json += F("\"narodmon_interval_min\":");
-  json += String((int)NARODMON_INTERVAL_MINUTES);
-  json += F(",\"narodmon_count\":");
-  json += String(g_nmCount);
-  json += F(",\"narodmon_skipped_crc\":");
-  json += String(g_nmCrcSkipped);
-  json += F(",\"narodmon_last_avg_c\":");
-  if (isnan(g_nmLastAvg)) {
-    json += F("null");
-  } else {
-    json += String(g_nmLastAvg, 3);
-  }
-  json += F(",\"narodmon_last_send_ok\":");
-  if (g_nmLastSendMs == 0) {
-    json += F("null");
-  } else {
-    json += g_nmLastSendOk ? F("true") : F("false");
-  }
-  json += F(",");
-
-  // Wi-Fi
-  json += F("\"wifi_ssid\":\"");
-  json += WIFI_SSID;
-  json += F("\",\"wifi_rssi_dbm\":");
+  json += F("\"wifi_rssi\":");
   json += String(g_lastRssiDbm);
-  json += F(",\"wifi_quality_percent\":");
-  json += String(wifiQuality(g_lastRssiDbm));
-
+  
   json += F("}");
-  server.send(200, "application/json; charset=utf-8", json);
+  server.send(200, "application/json", json);
 }
 
-// ----------------------------- Wi-Fi и main loop --------------------
+// ----------------------------- Wi-Fi Logic (IMPROVED) --------------------
 
 static void connectWifi() {
-  WiFi.persistent(false);
+  // Чистая инициализация
+  WiFi.persistent(false); 
+  WiFi.disconnect(true);  
+  delay(200);
+
   WiFi.mode(WIFI_STA);
-#if defined(ESP8266) || defined(ESP32)
-  WiFi.setSleep(false);        // выключаем power-save, чтобы не рвалось соединение
-  WiFi.setAutoReconnect(true); // автоматический реконнект
+  
+#if defined(ESP8266)
+  WiFi.hostname("MTS4x-Station");
+  // КРИТИЧНО для ESP8266: отключаем Modem Sleep, чтобы не терять пакеты
+  WiFi.setSleep(false);           
+#elif defined(ESP32)
+  WiFi.setHostname("MTS4x-Station");
+  WiFi.setSleep(false);
 #endif
+
+  WiFi.setAutoReconnect(true);
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
 
   Serial.print(F("[WiFi] Connecting to "));
   Serial.print(WIFI_SSID);
+
   uint8_t attempts = 0;
-  while (WiFi.status() != WL_CONNECTED && attempts < 60) {
+  // Ждем до 15 сек при первом старте
+  while (WiFi.status() != WL_CONNECTED && attempts < 30) {
     delay(500);
     Serial.print('.');
     ++attempts;
@@ -408,85 +307,91 @@ static void connectWifi() {
   Serial.println();
 
   if (WiFi.status() == WL_CONNECTED) {
-    Serial.print(F("[WiFi] Connected, IP = "));
+    Serial.print(F("[WiFi] Connected! IP: "));
     Serial.println(WiFi.localIP());
-    Serial.print(F("[WiFi] MAC = "));
-    Serial.println(WiFi.macAddress());
+    g_lastRssiDbm = WiFi.RSSI();
   } else {
-    Serial.println(F("[WiFi] Failed to connect, work without network"));
+    Serial.println(F("[WiFi] Connect failed. Will retry in loop."));
+    g_lastRssiDbm = -100;
   }
 }
 
 void setup() {
   Serial.begin(115200);
-  delay(200);
-  Serial.println();
-  Serial.println(F("[MTS4x] Meteostation starting..."));
+  delay(500);
+  Serial.println(F("\n[System] Booting MTS4x Station v2..."));
 
-  // I2C + датчик
+  // I2C
   if (!mts.begin(I2C_SDA_PIN, I2C_SCL_PIN)) {
-    Serial.print(F("[MTS4x] begin() failed, err="));
-    Serial.println(mts.lastError());
+    Serial.println(F("[MTS4x] Error: I2C/Sensor init failed!"));
   } else {
-    Serial.println(F("[MTS4x] I2C init OK"));
+    Serial.println(F("[MTS4x] Sensor found."));
+    // Конфигурация: 1 Гц, AVG 32, Sleep включен
+    mts.setConfig(MPS_1Hz, AVG_32, true);
   }
 
-  // Конфигурация: 1 Гц, AVG_32, Sleep_en=1 (single-shot)
-  if (!mts.setConfig(MPS_1Hz, AVG_32, true)) {
-    Serial.print(F("[MTS4x] setConfig() failed, err="));
-    Serial.println(mts.lastError());
-  } else {
-    Serial.println(F("[MTS4x] setConfig OK: MPS_1Hz, AVG_32, sleep"));
-  }
-
-  // Запускаем Wi-Fi и HTTP-сервер
   connectWifi();
+
   server.on("/", handleRoot);
   server.on("/json", handleJson);
   server.begin();
-  Serial.println(F("[HTTP] Server started on port 80"));
-
+  
   g_lastUiUpdateMs  = millis();
-  g_nmLastSendMs    = 0;
-  g_lastWifiCheckMs = millis();
+  g_wifiReconnectTimer = millis();
 }
 
 void loop() {
-  server.handleClient();
+  // 1. Обработка веб-сервера (только если есть сеть)
+  if (WiFi.status() == WL_CONNECTED) {
+    server.handleClient();
+  }
 
   unsigned long now = millis();
 
-  // Периодический цикл измерений/обновления UI
+  // 2. Менеджер подключения Wi-Fi (Watchdog)
+  // Проверяем статус раз в 30 секунд. Если отвалился - пробуем снова.
+  if (now - g_wifiReconnectTimer >= 30000UL) {
+    g_wifiReconnectTimer = now;
+    
+    if (WiFi.status() != WL_CONNECTED) {
+      Serial.println(F("[WiFi] Connection lost. Reconnecting..."));
+      WiFi.disconnect();
+      WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+      g_lastRssiDbm = -100;
+    } else {
+      // Если подключены - обновляем RSSI
+      g_lastRssiDbm = WiFi.RSSI();
+      if (g_lastRssiDbm < -90) {
+        Serial.print(F("[WiFi] Weak signal: "));
+        Serial.println(g_lastRssiDbm);
+      }
+    }
+  }
+
+  // 3. Цикл измерений (раз в 2 сек)
   if ((now - g_lastUiUpdateMs) >= UI_UPDATE_INTERVAL_MS) {
     performMeasurementCycle();
     g_lastUiUpdateMs = now;
   }
 
-  // Отправка на NarodMon
+  // 4. Отправка на NarodMon
   if ((now - g_nmLastSendMs) >= NARODMON_INTERVAL_MS && g_nmCount > 0) {
     float avg = g_nmSumTemp / (float)g_nmCount;
-    bool  ok  = sendToNarodMon(avg);
+    
+    Serial.print(F("[NarodMon] Sending avg="));
+    Serial.print(avg, 2);
+    
+    bool ok = sendToNarodMon(avg);
+    
+    Serial.println(ok ? F(" -> OK") : F(" -> FAIL"));
 
     g_nmLastAvg    = avg;
     g_nmLastSendOk = ok;
     g_nmLastSendMs = now;
-
-    // Сбрасываем накопители
+    
+    // Сброс
     g_nmSumTemp    = 0.0f;
     g_nmCount      = 0;
     g_nmCrcSkipped = 0;
-
-    Serial.print(F("[NarodMon] Send avg="));
-    Serial.print(avg, 3);
-    Serial.print(F(" °C, status="));
-    Serial.println(ok ? F("OK") : F("FAIL"));
-  }
-
-  // Периодически обновляем RSSI
-  if (now - g_lastWifiCheckMs >= 3000UL) {
-    if (WiFi.status() == WL_CONNECTED) {
-      g_lastRssiDbm = WiFi.RSSI();
-    }
-    g_lastWifiCheckMs = now;
   }
 }
